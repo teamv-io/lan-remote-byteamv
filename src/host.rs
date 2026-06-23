@@ -339,8 +339,14 @@ mod imp {
 
         // Input + clipboard + file reader loop — blocks on ctrl.recv()
         let mut enigo = Enigo::new(&Settings::default()).context("create Enigo")?;
-        let sw = width as f64;
-        let sh = height as f64;
+        // Map normalized cursor coords against the display's LOGICAL size (points),
+        // which is the coordinate space enigo injects into — not the capture pixel
+        // size. On a Retina Mac the capture is e.g. 2880×1800 px but the cursor
+        // space is 1440×900 pt, so using pixels would land the cursor at ~2× off.
+        let (disp_w, disp_h) = enigo.main_display().unwrap_or((width as i32, height as i32));
+        let sw = disp_w as f64;
+        let sh = disp_h as f64;
+        info!("Input mapping uses display size {disp_w}×{disp_h} (capture {width}×{height})");
         let mut files = FileReceiver::default();
 
         loop {

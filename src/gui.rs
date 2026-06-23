@@ -119,6 +119,9 @@ struct Session {
     handle: ViewerHandle,
     texture: Option<egui::TextureHandle>,
     screen_rect: egui::Rect,
+    /// Last normalized cursor position sent, to avoid flooding the host with
+    /// identical MouseMove events every frame (which would pin the host cursor).
+    last_mouse: Option<(f32, f32)>,
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -218,6 +221,7 @@ impl App {
                         handle,
                         texture: None,
                         screen_rect: egui::Rect::ZERO,
+                        last_mouse: None,
                     });
                     self.connect_error = None;
                     ctx.request_repaint();
@@ -627,7 +631,7 @@ fn render_one_session(ctx: &egui::Context, s: &mut Session) -> bool {
 }
 
 /// Forward mouse/keyboard/scroll events from a session window to its remote host.
-fn forward_input(vctx: &egui::Context, s: &Session) {
+fn forward_input(vctx: &egui::Context, s: &mut Session) {
     if s.texture.is_none() || s.screen_rect == egui::Rect::ZERO {
         return;
     }
@@ -641,10 +645,19 @@ fn forward_input(vctx: &egui::Context, s: &Session) {
         if s.screen_rect.contains(pos) {
             let nx = ((pos.x - s.screen_rect.min.x) / s.screen_rect.width()).clamp(0.0, 1.0);
             let ny = ((pos.y - s.screen_rect.min.y) / s.screen_rect.height()).clamp(0.0, 1.0);
-            s.handle
-                .input_tx
-                .try_send(ControlMsg::MouseMove { nx, ny })
-                .ok();
+            // Only send when the position actually changed — sending the same
+            // position every frame would continuously pin the host's own cursor.
+            let changed = match s.last_mouse {
+                Some((lx, ly)) => (nx - lx).abs() > 0.0005 || (ny - ly).abs() > 0.0005,
+                None => true,
+            };
+            if changed {
+                s.last_mouse = Some((nx, ny));
+                s.handle
+                    .input_tx
+                    .try_send(ControlMsg::MouseMove { nx, ny })
+                    .ok();
+            }
         }
     }
 
