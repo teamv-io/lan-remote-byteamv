@@ -224,7 +224,9 @@ impl ViewerWindow {
 }
 
 impl eframe::App for ViewerWindow {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+
         // Drain latest frame from decoder
         while let Ok(frame) = self.handle.frame_rx.try_recv() {
             let image = egui::ColorImage::from_rgba_unmultiplied(
@@ -245,7 +247,7 @@ impl eframe::App for ViewerWindow {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 if let Some(tex) = &self.texture {
                     let available = ui.available_size();
                     let resp = ui.add(
@@ -266,6 +268,7 @@ impl eframe::App for ViewerWindow {
             let events = ctx.input(|i| i.events.clone());
             let hover = ctx.input(|i| i.pointer.hover_pos());
             let scroll = ctx.input(|i| i.smooth_scroll_delta);
+            let _ = ctx; // suppress unused warning
 
             // Mouse move
             if let Some(pos) = hover {
@@ -328,7 +331,7 @@ impl eframe::App for ViewerWindow {
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         self.handle.stop.store(true, Ordering::Relaxed);
     }
 }

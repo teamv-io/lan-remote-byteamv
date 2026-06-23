@@ -93,19 +93,16 @@ fn detect_local_ip() -> String {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Check if we're in Viewing mode
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let is_viewing = matches!(self.mode, Mode::Viewing(_));
-
         if is_viewing {
-            self.render_viewer(ctx);
+            self.render_viewer(ui);
         } else {
-            self.render_menu(ctx);
+            self.render_menu(ui);
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Stop any running host or viewer threads
+    fn on_exit(&mut self) {
         match &self.mode {
             Mode::Hosting { stop, .. } => stop.store(true, Ordering::Relaxed),
             Mode::Viewing(h) => h.stop.store(true, Ordering::Relaxed),
@@ -115,10 +112,9 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn render_menu(&mut self, ctx: &egui::Context) {
-        // If we're connecting, poll for the result.
-        // We extract the receiver first to avoid holding a borrow on self.mode
-        // while mutating it.
+    fn render_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
         if matches!(self.mode, Mode::Connecting { .. }) {
             let poll = if let Mode::Connecting { result_rx } = &self.mode {
                 Some(result_rx.try_recv())
@@ -138,7 +134,6 @@ impl App {
                     ctx.request_repaint();
                 }
                 Some(Err(crossbeam_channel::TryRecvError::Empty)) => {
-                    // Still connecting — keep polling
                     ctx.request_repaint();
                 }
                 Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => {
@@ -149,7 +144,7 @@ impl App {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.add_space(16.0);
 
             // Title
@@ -184,7 +179,7 @@ impl App {
 
             match self.tab {
                 Tab::Host => self.show_host_tab(ui),
-                Tab::View => self.show_view_tab(ui, ctx),
+                Tab::View => self.show_view_tab(ui),
             }
         });
     }
@@ -305,7 +300,8 @@ impl App {
         });
     }
 
-    fn show_view_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn show_view_tab(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
         egui::Grid::new("view_grid")
             .num_columns(2)
             .spacing([16.0, 8.0])
@@ -377,7 +373,9 @@ impl App {
         });
     }
 
-    fn render_viewer(&mut self, ctx: &egui::Context) {
+    fn render_viewer(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+
         // Drain latest decoded frames
         if let Mode::Viewing(handle) = &self.mode {
             while let Ok(frame) = handle.frame_rx.try_recv() {
@@ -401,7 +399,7 @@ impl App {
         // Render the remote screen
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
-            .show(ctx, |ui| {
+            .show_inside(ui, |ui| {
                 if let Some(tex) = &self.texture {
                     let available = ui.available_size();
                     let resp = ui.add(
@@ -424,7 +422,7 @@ impl App {
         let mut disconnect = false;
         egui::Area::new(egui::Id::new("overlay"))
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
-            .show(ctx, |ui| {
+            .show(&ctx, |ui| {
                 if ui.button("✖  Disconnect").clicked() {
                     disconnect = true;
                 }
