@@ -14,8 +14,8 @@ pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rust P2P Viewer")
-            .with_inner_size([440.0, 400.0])
-            .with_min_inner_size([360.0, 340.0])
+            .with_inner_size([460.0, 440.0])
+            .with_min_inner_size([380.0, 360.0])
             .with_icon(std::sync::Arc::new(load_icon())),
         ..Default::default()
     };
@@ -84,59 +84,78 @@ fn setup_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-// ─── Tab ──────────────────────────────────────────────────────────────────────
+// ─── Tab ────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
 enum Tab {
     Host,
-    View,
+    Connect,
 }
 
-// ─── Mode ─────────────────────────────────────────────────────────────────────
+// ─── Host state ───────────────────────────────────────────────────────────────
 
-enum Mode {
+enum HostState {
     Idle,
     Hosting {
         status: Arc<Mutex<String>>,
         stop: Arc<AtomicBool>,
     },
-    Connecting {
-        result_rx: Receiver<Result<ViewerHandle>>,
-    },
-    Viewing(ViewerHandle),
+}
+
+// ─── Pending connection ─────────────────────────────────────────────────────
+
+/// A connection attempt in flight (handshake runs on a worker thread).
+struct Pending {
+    label: String,
+    rx: Receiver<Result<ViewerHandle>>,
+}
+
+// ─── Session ──────────────────────────────────────────────────────────────────
+
+/// An active viewer session, rendered in its own OS window (egui viewport).
+struct Session {
+    id: egui::ViewportId,
+    label: String,
+    handle: ViewerHandle,
+    texture: Option<egui::TextureHandle>,
+    screen_rect: egui::Rect,
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 struct App {
     tab: Tab,
+    // Host settings
     fps: u32,
     bitrate: u32,
-    host_ip: String,
     host_password: String,
-    view_password: String,
     local_ip: String,
-    mode: Mode,
-    texture: Option<egui::TextureHandle>,
-    screen_rect: egui::Rect,
+    host: HostState,
+    // Connect form
+    host_ip: String,
+    view_password: String,
     connect_error: Option<String>,
+    // Multi-session state
+    pending: Vec<Pending>,
+    sessions: Vec<Session>,
+    next_session: u64,
 }
 
 impl Default for App {
     fn default() -> Self {
-        let local_ip = detect_local_ip();
         Self {
-            tab: Tab::Host,
+            tab: Tab::Connect,
             fps: 30,
             bitrate: 8,
-            host_ip: String::new(),
             host_password: String::new(),
+            local_ip: detect_local_ip(),
+            host: HostState::Idle,
+            host_ip: String::new(),
             view_password: String::new(),
-            local_ip,
-            mode: Mode::Idle,
-            texture: None,
-            screen_rect: egui::Rect::ZERO,
             connect_error: None,
+            pending: Vec::new(),
+            sessions: Vec::new(),
+            next_session: 0,
         }
     }
 }
@@ -156,61 +175,68 @@ fn detect_local_ip() -> String {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let is_viewing = matches!(self.mode, Mode::Viewing(_));
-        if is_viewing {
-            self.render_viewer(ui);
-        } else {
-            self.render_menu(ui);
+        let ctx = ui.ctx().clone();
+
+        // Promote any finished connection attempts into live session windows.
+        self.poll_pending(&ctx);
+
+        // Main control window.
+        self.render_main(ui);
+
+        // Each active session renders in its own OS window.
+        self.render_sessions(&ctx);
+
+        // Keep the event loop ticking while anything is live so frames update.
+        if !self.sessions.is_empty() || !self.pending.is_empty() {
+            ctx.request_repaint();
         }
     }
 
     fn on_exit(&mut self) {
-        match &self.mode {
-            Mode::Hosting { stop, .. } => stop.store(true, Ordering::Relaxed),
-            Mode::Viewing(h) => h.stop.store(true, Ordering::Relaxed),
-            _ => {}
+        if let HostState::Hosting { stop, .. } = &self.host {
+            stop.store(true, Ordering::Relaxed);
+        }
+        for s in &self.sessions {
+            s.handle.stop.store(true, Ordering::Relaxed);
         }
     }
 }
 
 impl App {
-    fn render_menu(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-
-        if matches!(self.mode, Mode::Connecting { .. }) {
-            let poll = if let Mode::Connecting { result_rx } = &self.mode {
-                Some(result_rx.try_recv())
-            } else {
-                None
-            };
-            match poll {
-                Some(Ok(Ok(handle))) => {
-                    self.mode = Mode::Viewing(handle);
+    fn poll_pending(&mut self, ctx: &egui::Context) {
+        let mut still = Vec::new();
+        for p in std::mem::take(&mut self.pending) {
+            match p.rx.try_recv() {
+                Ok(Ok(handle)) => {
+                    let id = self.next_session;
+                    self.next_session += 1;
+                    self.sessions.push(Session {
+                        id: egui::ViewportId::from_hash_of(("rpv-session", id)),
+                        label: p.label.clone(),
+                        handle,
+                        texture: None,
+                        screen_rect: egui::Rect::ZERO,
+                    });
                     self.connect_error = None;
                     ctx.request_repaint();
-                    return;
                 }
-                Some(Ok(Err(e))) => {
-                    self.connect_error = Some(format!("Connection failed: {e:#}"));
-                    self.mode = Mode::Idle;
-                    ctx.request_repaint();
+                Ok(Err(e)) => {
+                    self.connect_error = Some(format!("Connect to {} failed: {e:#}", p.label));
                 }
-                Some(Err(crossbeam_channel::TryRecvError::Empty)) => {
-                    ctx.request_repaint();
+                Err(crossbeam_channel::TryRecvError::Empty) => still.push(p),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.connect_error = Some(format!("Connect to {} failed", p.label));
                 }
-                Some(Err(crossbeam_channel::TryRecvError::Disconnected)) => {
-                    self.connect_error = Some("Connection thread panicked".to_string());
-                    self.mode = Mode::Idle;
-                }
-                None => {}
             }
         }
+        self.pending = still;
+    }
 
+    fn render_main(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.add_space(16.0);
 
-            // Title
-            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.vertical_centered(|ui| {
                 ui.label(egui::RichText::new("Rust P2P Viewer").heading().strong());
                 ui.label(
                     egui::RichText::new("Direct LAN · Low Latency")
@@ -223,11 +249,19 @@ impl App {
             ui.separator();
             ui.add_space(12.0);
 
-            // Tab bar (centered, segmented look)
             ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    let tab_size = egui::vec2(96.0, 30.0);
+                    let tab_size = egui::vec2(110.0, 30.0);
+                    if ui
+                        .add_sized(
+                            tab_size,
+                            egui::SelectableLabel::new(self.tab == Tab::Connect, "CONNECT"),
+                        )
+                        .clicked()
+                    {
+                        self.tab = Tab::Connect;
+                    }
                     if ui
                         .add_sized(
                             tab_size,
@@ -236,15 +270,6 @@ impl App {
                         .clicked()
                     {
                         self.tab = Tab::Host;
-                    }
-                    if ui
-                        .add_sized(
-                            tab_size,
-                            egui::SelectableLabel::new(self.tab == Tab::View, "VIEW"),
-                        )
-                        .clicked()
-                    {
-                        self.tab = Tab::View;
                     }
                 });
             });
@@ -255,7 +280,7 @@ impl App {
 
             match self.tab {
                 Tab::Host => self.show_host_tab(ui),
-                Tab::View => self.show_view_tab(ui),
+                Tab::Connect => self.show_connect_tab(ui),
             }
         });
     }
@@ -266,11 +291,7 @@ impl App {
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
                 ui.label("Your LAN IP:");
-                ui.label(
-                    egui::RichText::new(&self.local_ip)
-                        .monospace()
-                        .color(ACCENT),
-                );
+                ui.label(egui::RichText::new(&self.local_ip).monospace().color(ACCENT));
                 ui.end_row();
 
                 ui.label("Password:");
@@ -293,17 +314,12 @@ impl App {
 
         ui.add_space(16.0);
 
-        // Start / Stop button (centered)
-        // Extract the stop handle before entering the layout closure to avoid
-        // holding a borrow on self.mode while we mutate it.
-        let is_hosting = matches!(self.mode, Mode::Hosting { .. });
-        let hosting_stop: Option<Arc<AtomicBool>> = if let Mode::Hosting { stop, .. } = &self.mode {
-            Some(stop.clone())
-        } else {
-            None
+        let hosting_stop: Option<Arc<AtomicBool>> = match &self.host {
+            HostState::Hosting { stop, .. } => Some(stop.clone()),
+            HostState::Idle => None,
         };
 
-        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+        ui.vertical_centered(|ui| {
             if let Some(stop) = hosting_stop {
                 if ui
                     .add(
@@ -314,81 +330,74 @@ impl App {
                     .clicked()
                 {
                     stop.store(true, Ordering::Relaxed);
-                    self.mode = Mode::Idle;
+                    self.host = HostState::Idle;
                 }
-            } else if !is_hosting {
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("▶  Start Hosting")
-                                .color(egui::Color32::from_rgb(15, 22, 16))
-                                .strong(),
-                        )
-                        .fill(ACCENT)
-                        .min_size(egui::vec2(200.0, 40.0)),
+            } else if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("▶  Start Hosting")
+                            .color(egui::Color32::from_rgb(15, 22, 16))
+                            .strong(),
                     )
-                    .clicked()
-                {
-                    let status = Arc::new(Mutex::new("Starting…".to_string()));
-                    let stop = Arc::new(AtomicBool::new(false));
-                    let status_clone = status.clone();
-                    let stop_clone = stop.clone();
-                    let fps = self.fps;
-                    let bitrate = self.bitrate;
-                    let password = self.host_password.clone();
+                    .fill(ACCENT)
+                    .min_size(egui::vec2(200.0, 40.0)),
+                )
+                .clicked()
+            {
+                let status = Arc::new(Mutex::new("Starting…".to_string()));
+                let stop = Arc::new(AtomicBool::new(false));
+                let status_clone = status.clone();
+                let stop_clone = stop.clone();
+                let fps = self.fps;
+                let bitrate = self.bitrate;
+                let password = self.host_password.clone();
 
-                    std::thread::Builder::new()
-                        .name("host-run".into())
-                        .spawn(move || {
-                            if let Err(e) = crate::host::run_with_stop(
-                                "0.0.0.0",
-                                7272,
-                                fps,
-                                bitrate,
-                                password,
-                                status_clone,
-                                stop_clone,
-                            ) {
-                                tracing::error!("Host error: {e:#}");
-                            }
-                        })
-                        .ok();
+                std::thread::Builder::new()
+                    .name("host-run".into())
+                    .spawn(move || {
+                        if let Err(e) = crate::host::run_with_stop(
+                            "0.0.0.0",
+                            7272,
+                            fps,
+                            bitrate,
+                            password,
+                            status_clone,
+                            stop_clone,
+                        ) {
+                            tracing::error!("Host error: {e:#}");
+                        }
+                    })
+                    .ok();
 
-                    self.mode = Mode::Hosting { status, stop };
-                }
+                self.host = HostState::Hosting { status, stop };
             }
         });
 
         ui.add_space(12.0);
 
-        // Status line
-        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            match &self.mode {
-                Mode::Hosting { status, .. } => {
-                    let s = status.lock().unwrap().clone();
-                    ui.label(egui::RichText::new(format!("● {s}")).color(ACCENT).small());
-                }
-                _ => {
-                    ui.label(
-                        egui::RichText::new("● Idle")
-                            .color(egui::Color32::GRAY)
-                            .small(),
-                    );
-                }
+        ui.vertical_centered(|ui| match &self.host {
+            HostState::Hosting { status, .. } => {
+                let s = status.lock().unwrap().clone();
+                ui.label(egui::RichText::new(format!("● {s}")).color(ACCENT).small());
             }
-
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Share your IP with the viewer")
-                    .small()
-                    .color(egui::Color32::GRAY),
-            );
+            HostState::Idle => {
+                ui.label(
+                    egui::RichText::new("● Idle")
+                        .color(egui::Color32::GRAY)
+                        .small(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Share your IP + password with the viewer")
+                        .small()
+                        .color(egui::Color32::from_gray(120)),
+                );
+            }
         });
     }
 
-    fn show_view_tab(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        egui::Grid::new("view_grid")
+    fn show_connect_tab(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("connect_grid")
             .num_columns(2)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
@@ -410,13 +419,10 @@ impl App {
                 ui.end_row();
             });
 
-        ui.add_space(16.0);
+        ui.add_space(14.0);
 
-        let is_connecting = matches!(self.mode, Mode::Connecting { .. });
-        let can_connect = !self.host_ip.is_empty() && !is_connecting;
-
-        // Connect button (centered)
-        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+        let can_connect = !self.host_ip.trim().is_empty();
+        ui.vertical_centered(|ui| {
             let btn = egui::Button::new(
                 egui::RichText::new("▶  Connect")
                     .color(egui::Color32::from_rgb(15, 22, 16))
@@ -425,87 +431,130 @@ impl App {
             .fill(ACCENT)
             .min_size(egui::vec2(200.0, 40.0));
             if ui.add_enabled(can_connect, btn).clicked() {
-                self.connect_error = None;
-                let ip = self.host_ip.clone();
-                let pw = self.view_password.clone();
-                let ctx2 = ctx.clone();
-                let (result_tx, result_rx) = crossbeam_channel::bounded(1);
-
-                std::thread::Builder::new()
-                    .name("viewer-connect".into())
-                    .spawn(move || {
-                        let result = crate::viewer::spawn_threads(&ip, 7272, &pw, ctx2);
-                        result_tx.send(result).ok();
-                    })
-                    .ok();
-
-                self.mode = Mode::Connecting { result_rx };
-            }
-
-            if is_connecting {
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new("Connecting…")
-                        .color(egui::Color32::GRAY)
-                        .small(),
-                );
-                ctx.request_repaint();
+                self.start_connect(ui.ctx().clone());
             }
         });
 
-        // Error message
         if let Some(err) = &self.connect_error {
             ui.add_space(8.0);
-            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.vertical_centered(|ui| {
                 ui.label(
                     egui::RichText::new(err)
-                        .color(egui::Color32::from_rgb(220, 60, 60))
+                        .color(egui::Color32::from_rgb(220, 80, 80))
                         .small(),
                 );
             });
         }
 
-        ui.add_space(12.0);
-        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+        if !self.pending.is_empty() {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Connecting… ({})", self.pending.len()))
+                        .color(egui::Color32::from_gray(150))
+                        .small(),
+                );
+            });
+        }
+
+        // Active session list with per-session disconnect.
+        if !self.sessions.is_empty() {
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
             ui.label(
-                egui::RichText::new("● Not connected")
-                    .color(egui::Color32::GRAY)
-                    .small(),
+                egui::RichText::new(format!("Active sessions ({})", self.sessions.len())).strong(),
             );
+            ui.add_space(4.0);
+
+            let mut close: Vec<egui::ViewportId> = Vec::new();
+            for s in &self.sessions {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("●").color(ACCENT));
+                    ui.label(&s.label);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Disconnect").clicked() {
+                            close.push(s.id);
+                        }
+                    });
+                });
+            }
+            if !close.is_empty() {
+                self.sessions.retain(|s| {
+                    if close.contains(&s.id) {
+                        s.handle.stop.store(true, Ordering::Relaxed);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+    }
+
+    fn start_connect(&mut self, ctx: egui::Context) {
+        self.connect_error = None;
+        let ip = self.host_ip.trim().to_string();
+        let pw = self.view_password.clone();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+
+        std::thread::Builder::new()
+            .name("viewer-connect".into())
+            .spawn(move || {
+                let result = crate::viewer::spawn_threads(&ip, 7272, &pw, ctx);
+                tx.send(result).ok();
+            })
+            .ok();
+
+        self.pending.push(Pending {
+            label: self.host_ip.trim().to_string(),
+            rx,
         });
     }
 
-    fn render_viewer(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
+    fn render_sessions(&mut self, ctx: &egui::Context) {
+        // Take the list out so each session can be borrowed mutably inside the
+        // viewport callback without conflicting with `self`.
+        let mut sessions = std::mem::take(&mut self.sessions);
+        sessions.retain_mut(|s| render_one_session(ctx, s));
+        // Preserve any sessions that were created while we were rendering.
+        self.sessions.append(&mut sessions);
+    }
+}
 
-        // Drain latest decoded frames
-        if let Mode::Viewing(handle) = &self.mode {
-            while let Ok(frame) = handle.frame_rx.try_recv() {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.data,
-                );
-                match self.texture.as_mut() {
-                    Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-                    None => {
-                        self.texture = Some(ctx.load_texture(
-                            "remote_screen_gui",
-                            image,
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    }
-                }
+/// Render a single session in its own OS window. Returns `false` if the window
+/// was closed (so the caller drops the session).
+fn render_one_session(ctx: &egui::Context, s: &mut Session) -> bool {
+    // Pull the newest decoded frames into the texture (done outside the viewport
+    // callback so the borrow of `s` stays simple).
+    while let Ok(frame) = s.handle.frame_rx.try_recv() {
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width as usize, frame.height as usize],
+            &frame.data,
+        );
+        match s.texture.as_mut() {
+            Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                s.texture = Some(ctx.load_texture(
+                    format!("remote-{:?}", s.id),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
             }
         }
+    }
 
-        // Render the remote screen
+    let builder = egui::ViewportBuilder::default()
+        .with_title(format!("{} — Rust P2P Viewer", s.label))
+        .with_inner_size([1280.0, 720.0]);
+
+    let mut keep = true;
+    ctx.show_viewport_immediate(s.id, builder, |vctx, _class| {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
-            .show_inside(ui, |ui| {
-                if let Some(tex) = &self.texture {
-                    // Aspect-correct fit: compute the exact rect the image occupies
-                    // so mouse coordinates map 1:1 (no letterbox offset).
-                    self.screen_rect = paint_remote(ui, tex);
+            .show(vctx, |ui| {
+                if let Some(tex) = &s.texture {
+                    s.screen_rect = paint_remote(ui, tex);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(egui::RichText::new("Connecting…").color(egui::Color32::WHITE));
@@ -513,110 +562,94 @@ impl App {
                 }
             });
 
-        // Disconnect overlay button (top-right)
-        let mut disconnect = false;
-        egui::Area::new(egui::Id::new("overlay"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
-            .show(&ctx, |ui| {
-                if ui.button("✖  Disconnect").clicked() {
-                    disconnect = true;
-                }
-            });
+        forward_input(vctx, s);
 
-        if disconnect {
-            if let Mode::Viewing(h) = &self.mode {
-                h.stop.store(true, Ordering::Relaxed);
-            }
-            self.mode = Mode::Idle;
-            self.texture = None;
-            self.screen_rect = egui::Rect::ZERO;
-            return;
+        if vctx.input(|i| i.viewport().close_requested()) {
+            keep = false;
         }
+        vctx.request_repaint();
+    });
 
-        // Forward input events to the remote host
-        if self.texture.is_some() && self.screen_rect != egui::Rect::ZERO {
-            if let Mode::Viewing(handle) = &self.mode {
-                let events = ctx.input(|i| i.events.clone());
-                let hover = ctx.input(|i| i.pointer.hover_pos());
-                let scroll = ctx.input(|i| i.smooth_scroll_delta);
+    if !keep {
+        s.handle.stop.store(true, Ordering::Relaxed);
+    }
+    keep
+}
 
-                // Mouse move
-                if let Some(pos) = hover {
-                    if self.screen_rect.contains(pos) {
-                        let nx = ((pos.x - self.screen_rect.min.x) / self.screen_rect.width())
-                            .clamp(0.0, 1.0);
-                        let ny = ((pos.y - self.screen_rect.min.y) / self.screen_rect.height())
-                            .clamp(0.0, 1.0);
-                        handle
-                            .input_tx
-                            .try_send(crate::proto::ControlMsg::MouseMove { nx, ny })
-                            .ok();
-                    }
-                }
+/// Forward mouse/keyboard/scroll events from a session window to its remote host.
+fn forward_input(vctx: &egui::Context, s: &Session) {
+    if s.texture.is_none() || s.screen_rect == egui::Rect::ZERO {
+        return;
+    }
+    use crate::proto::ControlMsg;
 
-                // Scroll
-                if scroll.length() > 0.1 {
-                    handle
+    let events = vctx.input(|i| i.events.clone());
+    let hover = vctx.input(|i| i.pointer.hover_pos());
+    let scroll = vctx.input(|i| i.smooth_scroll_delta);
+
+    if let Some(pos) = hover {
+        if s.screen_rect.contains(pos) {
+            let nx = ((pos.x - s.screen_rect.min.x) / s.screen_rect.width()).clamp(0.0, 1.0);
+            let ny = ((pos.y - s.screen_rect.min.y) / s.screen_rect.height()).clamp(0.0, 1.0);
+            s.handle
+                .input_tx
+                .try_send(ControlMsg::MouseMove { nx, ny })
+                .ok();
+        }
+    }
+
+    if scroll.length() > 0.1 {
+        s.handle
+            .input_tx
+            .try_send(ControlMsg::MouseScroll {
+                dx: scroll.x / 20.0,
+                dy: scroll.y / 20.0,
+            })
+            .ok();
+    }
+
+    for event in &events {
+        match event {
+            egui::Event::PointerButton {
+                button, pressed, ..
+            } => {
+                let btn = match button {
+                    egui::PointerButton::Primary => 0u8,
+                    egui::PointerButton::Secondary => 1,
+                    egui::PointerButton::Middle => 2,
+                    _ => continue,
+                };
+                s.handle
+                    .input_tx
+                    .try_send(ControlMsg::MouseButton {
+                        btn,
+                        pressed: *pressed,
+                    })
+                    .ok();
+            }
+            egui::Event::Key { key, pressed, .. } => {
+                if let Some(kc) = egui_key_to_wire(*key) {
+                    s.handle
                         .input_tx
-                        .try_send(crate::proto::ControlMsg::MouseScroll {
-                            dx: scroll.x / 20.0,
-                            dy: scroll.y / 20.0,
+                        .try_send(ControlMsg::KeyPress {
+                            keycode: kc,
+                            pressed: *pressed,
                         })
                         .ok();
                 }
-
-                // Keyboard + pointer buttons
-                for event in &events {
-                    match event {
-                        egui::Event::PointerButton {
-                            button, pressed, ..
-                        } => {
-                            let btn = match button {
-                                egui::PointerButton::Primary => 0u8,
-                                egui::PointerButton::Secondary => 1,
-                                egui::PointerButton::Middle => 2,
-                                _ => continue,
-                            };
-                            handle
-                                .input_tx
-                                .try_send(crate::proto::ControlMsg::MouseButton {
-                                    btn,
-                                    pressed: *pressed,
-                                })
-                                .ok();
-                        }
-                        egui::Event::Key { key, pressed, .. } => {
-                            if let Some(kc) = egui_key_to_wire(*key) {
-                                handle
-                                    .input_tx
-                                    .try_send(crate::proto::ControlMsg::KeyPress {
-                                        keycode: kc,
-                                        pressed: *pressed,
-                                    })
-                                    .ok();
-                            }
-                        }
-                        egui::Event::Text(text) => {
-                            for ch in text.chars() {
-                                if !ch.is_control() {
-                                    handle
-                                        .input_tx
-                                        .try_send(crate::proto::ControlMsg::KeyChar {
-                                            ch: ch as u32,
-                                        })
-                                        .ok();
-                                }
-                            }
-                        }
-                        _ => {}
+            }
+            egui::Event::Text(text) => {
+                for ch in text.chars() {
+                    if !ch.is_control() {
+                        s.handle
+                            .input_tx
+                            .try_send(ControlMsg::KeyChar { ch: ch as u32 })
+                            .ok();
                     }
                 }
             }
+            _ => {}
         }
-
-        // Keep redrawing so newly decoded frames are shown without waiting for an
-        // OS input event (the Windows event loop otherwise idles → frozen image).
-        ctx.request_repaint();
     }
 }
 
