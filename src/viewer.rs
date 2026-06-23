@@ -249,13 +249,7 @@ impl eframe::App for ViewerWindow {
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
             .show_inside(ui, |ui| {
                 if let Some(tex) = &self.texture {
-                    let available = ui.available_size();
-                    let resp = ui.add(
-                        egui::Image::new(tex)
-                            .fit_to_exact_size(available)
-                            .sense(egui::Sense::hover()),
-                    );
-                    self.screen_rect = resp.rect;
+                    self.screen_rect = crate::gui::paint_remote(ui, tex);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(egui::RichText::new("Connecting…").color(egui::Color32::WHITE));
@@ -268,7 +262,6 @@ impl eframe::App for ViewerWindow {
             let events = ctx.input(|i| i.events.clone());
             let hover = ctx.input(|i| i.pointer.hover_pos());
             let scroll = ctx.input(|i| i.smooth_scroll_delta);
-            let _ = ctx; // suppress unused warning
 
             // Mouse move
             if let Some(pos) = hover {
@@ -329,6 +322,9 @@ impl eframe::App for ViewerWindow {
                 }
             }
         }
+
+        // Keep redrawing so newly decoded frames appear without an input event.
+        ctx.request_repaint();
     }
 
     fn on_exit(&mut self) {

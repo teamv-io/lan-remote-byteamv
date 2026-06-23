@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use openh264::decoder::Decoder;
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate};
+use openh264::encoder::{
+    BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, SpsPpsStrategy, UsageType,
+};
 use openh264::formats::{YUVBuffer, YUVSource};
 use openh264::OpenH264API;
 
@@ -15,10 +17,24 @@ impl VideoEncoder {
         let api = OpenH264API::from_source();
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bitrate_mbps * 1_000_000))
-            .max_frame_rate(FrameRate::from_hz(fps as f32));
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            // Tune for screen content (sharp edges, text) rather than camera video
+            .usage_type(UsageType::ScreenContentRealTime)
+            // Repeat SPS/PPS so a viewer can recover after packet loss
+            .sps_pps_strategy(SpsPpsStrategy::IncreasingId)
+            // Emit a keyframe at least once per second. Over UDP, a single lost
+            // packet corrupts the dependent P-frames until the next keyframe —
+            // without this the viewer freezes permanently on the first drop.
+            .intra_frame_period(IntraFramePeriod::from_num_frames(fps.max(1)));
         Ok(Self {
             enc: Encoder::with_api_config(api, config).context("create H.264 encoder")?,
         })
+    }
+
+    /// Force the next encoded frame to be a keyframe (used to satisfy a viewer's
+    /// recovery request after it detects corruption).
+    pub fn force_keyframe(&mut self) {
+        self.enc.force_intra_frame();
     }
 
     /// Encode a BGRA frame; returns raw H.264 bytes (all NAL units concatenated)

@@ -401,13 +401,9 @@ impl App {
             .frame(egui::Frame::default().fill(egui::Color32::BLACK))
             .show_inside(ui, |ui| {
                 if let Some(tex) = &self.texture {
-                    let available = ui.available_size();
-                    let resp = ui.add(
-                        egui::Image::new(tex)
-                            .fit_to_exact_size(available)
-                            .sense(egui::Sense::hover()),
-                    );
-                    self.screen_rect = resp.rect;
+                    // Aspect-correct fit: compute the exact rect the image occupies
+                    // so mouse coordinates map 1:1 (no letterbox offset).
+                    self.screen_rect = paint_remote(ui, tex);
                 } else {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -516,5 +512,29 @@ impl App {
                 }
             }
         }
+
+        // Keep redrawing so newly decoded frames are shown without waiting for an
+        // OS input event (the Windows event loop otherwise idles → frozen image).
+        ctx.request_repaint();
     }
+}
+
+/// Paint a texture into the current UI, aspect-correct and centered, and return
+/// the exact rect the image occupies (for input coordinate mapping).
+pub(crate) fn paint_remote(ui: &mut egui::Ui, tex: &egui::TextureHandle) -> egui::Rect {
+    let panel = ui.available_rect_before_wrap();
+    let img = tex.size_vec2();
+    if img.x <= 0.0 || img.y <= 0.0 {
+        return panel;
+    }
+    let scale = (panel.width() / img.x).min(panel.height() / img.y);
+    let draw = img * scale;
+    let rect = egui::Rect::from_center_size(panel.center(), draw);
+    ui.painter().image(
+        tex.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    rect
 }
