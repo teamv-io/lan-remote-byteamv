@@ -16,13 +16,11 @@ jobs:
         include:
           - name: Windows x64
             os: windows-latest
-            target: x86_64-pc-windows-msvc
             bin: rust-p2p-viewer.exe
             formats: nsis
 
           - name: macOS Apple Silicon
             os: macos-14          # GitHub M1/M2 runner (arm64)
-            target: aarch64-apple-darwin
             bin: rust-p2p-viewer
             formats: dmg
 
@@ -31,53 +29,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Defender real-time scanning of every .obj/.rlib/.exe is a big tax on the
+      # Windows runner — exclude the workspace to speed up compile + link.
+      - name: Exclude workspace from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath '${{ github.workspace }}'
+        continue-on-error: true
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
 
-      # openh264 downloads/builds a prebuilt lib — worth caching
-      - name: Cache cargo registry + build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+      # Smart incremental caching (registry + git + target), keyed on Cargo.lock.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
 
-      # Each runner is already native to its target (macos-14 = arm64,
-      # windows-latest = x64), so we build natively into target/release —
-      # no --target juggling, and cargo-packager finds the binary directly.
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
 
-      - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+      # Installers are only cut for tagged releases. Routine branch pushes just
+      # build (fast validation) and skip packaging entirely.
+      - name: Install cargo-binstall
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: cargo-bins/cargo-binstall@main
 
       - name: Build installer
-        run: cargo packager --release --formats ${{ matrix.formats }} --verbose
-
-      - name: Collect artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
+          # Prebuilt binary instead of compiling cargo-packager from source
+          # (saves several minutes, especially on Windows/MSVC).
+          cargo binstall -y cargo-packager
+          cargo packager --release --formats ${{ matrix.formats }} --verbose
           mkdir -p out
-          # Raw binary
-          cp "target/release/${{ matrix.bin }}" out/
-          # Installers (.dmg / *-setup.exe / .msi) — names may contain spaces
-          find target -maxdepth 3 \( -name "*.dmg" -o -name "*-setup.exe" -o -name "*.msi" \) -exec cp {} out/ \;
-          echo "--- collected ---"
+          find target -maxdepth 3 \( -name "*.dmg" -o -name "*-setup.exe" \) -exec cp {} out/ \;
+          echo "--- installers ---"
           ls -la out
 
-      - name: Upload artifacts
+      - name: Upload installer
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: installer-${{ matrix.os }}
           path: out/*
           if-no-files-found: error
 
-  # GitHub Release is only created when a v* tag is pushed
+  # GitHub Release (installers only) is created when a v* tag is pushed.
   publish:
     name: Publish GitHub Release
     needs: build
@@ -95,13 +92,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p release
-          # macOS installer + raw binary
           find artifacts -name "*.dmg" -exec cp {} "release/RustP2PViewer-macos-arm64.dmg" \;
-          cp "artifacts/aarch64-apple-darwin/rust-p2p-viewer" "release/rust-p2p-viewer-macos-arm64" 2>/dev/null || true
-          chmod +x "release/rust-p2p-viewer-macos-arm64" 2>/dev/null || true
-          # Windows installer + raw binary
           find artifacts -name "*-setup.exe" -exec cp {} "release/RustP2PViewer-windows-x64-setup.exe" \;
-          cp "artifacts/x86_64-pc-windows-msvc/rust-p2p-viewer.exe" "release/rust-p2p-viewer-windows-x64.exe" 2>/dev/null || true
           echo "--- release assets ---"
           ls -la release
 
@@ -115,15 +107,16 @@ jobs:
           body: |
             ## Install
 
-            **macOS (Apple Silicon)** — download `RustP2PViewer-macos-arm64.dmg`, open it, drag the app to Applications.
-            On first launch, right-click the app → **Open** (it isn't code-signed, so Gatekeeper needs a one-time manual allow), or run:
-            ```
-            xattr -dr com.apple.quarantine "/Applications/Rust P2P Viewer.app"
-            ```
+            ### macOS (Apple Silicon)
+            1. Download `RustP2PViewer-macos-arm64.dmg`, open it, drag the app to **Applications**.
+            2. **Important** — macOS flags unsigned downloaded apps as "damaged". Clear the quarantine flag once (Terminal):
+               ```
+               xattr -cr "/Applications/Rust P2P Viewer.app"
+               ```
+            3. Open the app normally. (Not malware — just unsigned.)
 
-            **Windows (x64)** — download `RustP2PViewer-windows-x64-setup.exe` and run it.
-            SmartScreen may warn because it's unsigned → **More info → Run anyway**.
-
-            Standalone CLI binaries (`*-macos-arm64`, `*-windows-x64.exe`) are also attached.
+            ### Windows (x64)
+            Download `RustP2PViewer-windows-x64-setup.exe` and run it.
+            SmartScreen may warn (unsigned) → **More info → Run anyway**.
           files: |
             release/*
