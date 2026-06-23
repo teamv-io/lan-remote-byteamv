@@ -68,4 +68,10 @@ impl ControlChannel {
             cipher: self.cipher.clone(),
         })
     }
+
+    /// A raw clone of the underlying stream, for `shutdown()` to unblock a reader
+    /// thread that is parked in `recv()` when the session is asked to stop.
+    pub fn try_clone_stream(&self) -> Result<TcpStream> {
+        self.stream.try_clone().context("clone TcpStream")
+    }
 }

@@ -4,6 +4,7 @@ mod crypto;
 mod gui;
 mod host;
 mod proto;
+mod sync;
 mod transport;
 mod viewer;
 
@@ -34,6 +35,8 @@ enum Cmd {
         bitrate: u32,
         #[arg(short = 'k', long, default_value = "", help = "Connection password")]
         password: String,
+        #[arg(long, help = "Enable bidirectional clipboard sync")]
+        clipboard: bool,
     },
     /// Connect and view/control a remote host
     View {
@@ -63,7 +66,8 @@ fn main() -> Result<()> {
             fps,
             bitrate,
             password,
-        }) => host::run(&bind, port, fps, bitrate, &password),
+            clipboard,
+        }) => host::run(&bind, port, fps, bitrate, &password, clipboard),
         Some(Cmd::View {
             host,
             port,

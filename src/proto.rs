@@ -50,6 +50,29 @@ pub enum ControlMsg {
         ch: u32,
     },
 
+    /// Clipboard text sync (either direction). Only acted on if the receiver has
+    /// clipboard sync enabled.
+    Clipboard {
+        text: String,
+    },
+
+    // File transfer (currently Viewer → Host). `id` groups a single transfer.
+    /// Begin a file transfer: name (basename only) and total size in bytes.
+    FileStart {
+        id: u32,
+        name: String,
+        size: u64,
+    },
+    /// A sequential chunk of file bytes.
+    FileChunk {
+        id: u32,
+        data: Vec<u8>,
+    },
+    /// End of a file transfer.
+    FileEnd {
+        id: u32,
+    },
+
     Ping,
     Pong,
 }

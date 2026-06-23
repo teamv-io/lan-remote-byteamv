@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -12,6 +12,7 @@ use tracing::{error, info, warn};
 use crate::codec::VideoDecoder;
 use crate::crypto::{derive_key, Cipher};
 use crate::proto::{ControlMsg, InboundVideo};
+use crate::sync::{apply_remote_clipboard, spawn_clipboard_watch, FileReceiver};
 use crate::transport::{recv_salt, ControlChannel};
 
 /// A decoded RGBA frame ready for display
@@ -28,6 +29,8 @@ pub struct ViewerHandle {
     pub remote_w: u32,
     pub remote_h: u32,
     pub stop: Arc<AtomicBool>,
+    /// Toggled by the GUI to enable/disable bidirectional clipboard sync.
+    pub clipboard_enabled: Arc<AtomicBool>,
 }
 
 /// Connects + handshakes synchronously, then spawns decode pipeline threads.
@@ -122,11 +125,35 @@ pub fn spawn_threads(
             })?;
     }
 
-    // Input sender thread — reads from input_rx, sends over TCP ctrl channel
+    // Clone a reader handle before the writer thread takes ownership of `ctrl`
+    // (send and recv are independent directions on the duplex TCP connection).
+    let mut ctrl_reader = ctrl.try_clone()?;
+
+    // Shutdown watcher: when `stop` is set (Disconnect / window closed), close the
+    // socket so both the reader (parked in recv) and writer unblock — and the host
+    // sees EOF and frees the session instead of staying stuck on a dead connection.
+    {
+        let stop = stop.clone();
+        let shutdown_stream = ctrl.try_clone_stream()?;
+        std::thread::Builder::new()
+            .name("ctrl-shutdown".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
+            })?;
+    }
+
+    // Clipboard sync state shared between the watch thread and the reader thread.
+    let clipboard_enabled = Arc::new(AtomicBool::new(false));
+    let last_clip = Arc::new(Mutex::new(String::new()));
+
+    // Input/output sender thread — reads from input_rx, sends over TCP ctrl channel
     {
         let stop = stop.clone();
         std::thread::Builder::new()
-            .name("input-send".into())
+            .name("ctrl-send".into())
             .spawn(move || loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -143,12 +170,52 @@ pub fn spawn_threads(
             })?;
     }
 
+    // Control reader thread — handles host → viewer messages (clipboard, files).
+    {
+        let stop = stop.clone();
+        let enabled = clipboard_enabled.clone();
+        let last = last_clip.clone();
+        std::thread::Builder::new()
+            .name("ctrl-recv".into())
+            .spawn(move || {
+                let mut files = FileReceiver::default();
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match ctrl_reader.recv() {
+                        Ok(ControlMsg::Clipboard { text }) => {
+                            if enabled.load(Ordering::Relaxed) {
+                                apply_remote_clipboard(text, last.clone());
+                            }
+                        }
+                        Ok(
+                            msg @ (ControlMsg::FileStart { .. }
+                            | ControlMsg::FileChunk { .. }
+                            | ControlMsg::FileEnd { .. }),
+                        ) => files.handle(&msg),
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            })?;
+    }
+
+    // Clipboard watch thread — forwards local copies to the host while enabled.
+    spawn_clipboard_watch(
+        clipboard_enabled.clone(),
+        last_clip,
+        input_tx.clone(),
+        stop.clone(),
+    );
+
     Ok(ViewerHandle {
         frame_rx,
         input_tx,
         remote_w,
         remote_h,
         stop,
+        clipboard_enabled,
     })
 }
 

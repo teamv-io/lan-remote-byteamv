@@ -8,7 +8,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 #[cfg(not(feature = "capture"))]
-pub fn run(_bind: &str, _port: u16, _fps: u32, _bitrate_mbps: u32, _password: &str) -> Result<()> {
+pub fn run(
+    _bind: &str,
+    _port: u16,
+    _fps: u32,
+    _bitrate_mbps: u32,
+    _password: &str,
+    _clipboard: bool,
+) -> Result<()> {
     anyhow::bail!("This build was compiled without screen-capture support (viewer-only)")
 }
 
@@ -19,6 +26,7 @@ pub fn run_with_stop(
     _fps: u32,
     _bitrate_mbps: u32,
     _password: String,
+    _clipboard: bool,
     status: Arc<Mutex<String>>,
     _stop: Arc<AtomicBool>,
 ) -> Result<()> {
@@ -46,9 +54,17 @@ mod imp {
     use crate::codec::VideoEncoder;
     use crate::crypto::{derive_key, random_bytes, Cipher, SALT_LEN};
     use crate::proto::{ControlMsg, VideoPacket, VIDEO_CHUNK_MAX};
+    use crate::sync::{apply_remote_clipboard, spawn_clipboard_watch, FileReceiver};
     use crate::transport::{send_salt, ControlChannel};
 
-    pub fn run(bind: &str, port: u16, fps: u32, bitrate_mbps: u32, password: &str) -> Result<()> {
+    pub fn run(
+        bind: &str,
+        port: u16,
+        fps: u32,
+        bitrate_mbps: u32,
+        password: &str,
+        clipboard: bool,
+    ) -> Result<()> {
         if !scap::is_supported() {
             anyhow::bail!("Screen capture not supported on this platform");
         }
@@ -69,9 +85,14 @@ mod imp {
                 Ok(stream) => {
                     let peer = stream.peer_addr()?;
                     info!("Viewer connected from {peer}");
-                    if let Err(e) =
-                        handle_session(stream, peer.ip().to_string(), fps, bitrate_mbps, password)
-                    {
+                    if let Err(e) = handle_session(
+                        stream,
+                        peer.ip().to_string(),
+                        fps,
+                        bitrate_mbps,
+                        password,
+                        clipboard,
+                    ) {
                         error!("Session error: {e:#}");
                     }
                     info!("Viewer disconnected, waiting for next connection");
@@ -89,6 +110,7 @@ mod imp {
         fps: u32,
         bitrate_mbps: u32,
         password: String,
+        clipboard: bool,
         status: Arc<Mutex<String>>,
         stop: Arc<AtomicBool>,
     ) -> Result<()> {
@@ -121,9 +143,14 @@ mod imp {
 
                     // Switch back to blocking for session I/O
                     stream.set_nonblocking(false).ok();
-                    if let Err(e) =
-                        handle_session(stream, peer.ip().to_string(), fps, bitrate_mbps, &password)
-                    {
+                    if let Err(e) = handle_session(
+                        stream,
+                        peer.ip().to_string(),
+                        fps,
+                        bitrate_mbps,
+                        &password,
+                        clipboard,
+                    ) {
                         error!("Session error: {e:#}");
                     }
 
@@ -151,6 +178,7 @@ mod imp {
         fps: u32,
         bitrate_mbps: u32,
         password: &str,
+        clipboard_enabled: bool,
     ) -> Result<()> {
         stream.set_nodelay(true)?;
 
@@ -282,13 +310,51 @@ mod imp {
                 capturer.stop_capture();
             })?;
 
-        // Input injection — runs on this thread, blocks on ctrl.recv()
+        // Full-duplex control: a writer thread handles host → viewer messages
+        // (clipboard), while this thread reads viewer → host (input, clipboard, files).
+        let (out_tx, out_rx) = bounded::<ControlMsg>(256);
+        let session_stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut writer = ctrl.try_clone()?;
+            std::thread::Builder::new()
+                .name("ctrl-send".into())
+                .spawn(move || {
+                    while let Ok(msg) = out_rx.recv() {
+                        if writer.send(&msg).is_err() {
+                            break;
+                        }
+                    }
+                })?;
+        }
+
+        // Clipboard sync (shared toggle + last value to suppress echo loops).
+        let clip_enabled = Arc::new(AtomicBool::new(clipboard_enabled));
+        let last_clip = Arc::new(Mutex::new(String::new()));
+        spawn_clipboard_watch(
+            clip_enabled.clone(),
+            last_clip.clone(),
+            out_tx.clone(),
+            session_stop.clone(),
+        );
+
+        // Input + clipboard + file reader loop — blocks on ctrl.recv()
         let mut enigo = Enigo::new(&Settings::default()).context("create Enigo")?;
         let sw = width as f64;
         let sh = height as f64;
+        let mut files = FileReceiver::default();
 
         loop {
             match ctrl.recv() {
+                Ok(ControlMsg::Clipboard { text }) => {
+                    if clip_enabled.load(Ordering::Relaxed) {
+                        apply_remote_clipboard(text, last_clip.clone());
+                    }
+                }
+                Ok(
+                    msg @ (ControlMsg::FileStart { .. }
+                    | ControlMsg::FileChunk { .. }
+                    | ControlMsg::FileEnd { .. }),
+                ) => files.handle(&msg),
                 Ok(msg) => handle_input(&mut enigo, msg, sw, sh),
                 Err(e) => {
                     info!("Control channel closed: {e}");
@@ -296,6 +362,7 @@ mod imp {
                 }
             }
         }
+        session_stop.store(true, Ordering::Relaxed);
         Ok(())
     }
 

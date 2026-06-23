@@ -3609,6 +3609,7 @@ name = "rust-p2p-viewer"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "argon2",
  "bincode",
  "chacha20poly1305",

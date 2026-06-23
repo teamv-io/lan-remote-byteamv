@@ -41,6 +41,9 @@ openh264 = { version = "0.9", features = ["source"] }
 # Cross-platform input injection
 enigo = "0.6"
 
+# Cross-platform clipboard access (text sync)
+arboard = "3"
+
 # GUI framework (replaces winit + softbuffer)
 eframe = "0.34"
 
