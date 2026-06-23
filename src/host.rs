@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use scap::capturer::{Capturer, Options, Resolution};
-use scap::frame::{Frame, FrameType};
+use scap::frame::{Frame, FrameType, VideoFrame};
 use tracing::{error, info, warn};
 
 use crate::codec::VideoEncoder;
@@ -13,7 +13,6 @@ use crate::proto::{ControlMsg, VideoPacket, VIDEO_CHUNK_MAX, VIDEO_PORT};
 use crate::transport::ControlChannel;
 
 pub fn run(bind: &str, port: u16, fps: u32, bitrate_mbps: u32) -> Result<()> {
-    // macOS requires Screen Recording permission; scap will tell us
     if !scap::is_supported() {
         anyhow::bail!("Screen capture not supported on this platform");
     }
@@ -29,7 +28,6 @@ pub fn run(bind: &str, port: u16, fps: u32, bitrate_mbps: u32) -> Result<()> {
     info!("Listening on {bind}:{port}");
     info!("Run `lan-remote view <this_ip>` on the viewer machine");
 
-    // Accept one viewer at a time (single-session design)
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
@@ -55,20 +53,26 @@ fn handle_session(
     stream.set_nodelay(true)?;
     let mut ctrl = ControlChannel::new(stream);
 
-    // Handshake: wait for Hello, then send Welcome
     match ctrl.recv()? {
         ControlMsg::Hello => {}
         other => anyhow::bail!("expected Hello, got {other:?}"),
     }
 
-    // Probe first frame to learn dimensions
-    let (width, height) = probe_screen_size(fps)?;
+    // Use get_output_frame_size to learn dimensions without capturing a frame
+    let [width, height] = {
+        let mut probe = Capturer::build(Options {
+            fps,
+            output_type: FrameType::BGRAFrame,
+            output_resolution: Resolution::Captured,
+            ..Default::default()
+        })
+        .map_err(|e| anyhow::anyhow!("capturer probe: {e:?}"))?;
+        probe.get_output_frame_size()
+    };
     ctrl.send(&ControlMsg::Welcome { width, height, fps })?;
     info!("Screen size {width}×{height}, streaming at {fps} fps / {bitrate_mbps} Mbps");
 
-    // Channel: raw BGRA frames → encoder thread
     let (frame_tx, frame_rx) = bounded::<Vec<u8>>(2);
-    // Channel: encoded NAL data → UDP sender thread
     let (nal_tx, nal_rx) = bounded::<Vec<u8>>(4);
 
     let viewer_video_addr = format!("{viewer_ip}:{VIDEO_PORT}");
@@ -124,27 +128,26 @@ fn handle_session(
             }
         })?;
 
-    // Capture thread (owns the Capturer — must be created on the thread it runs on)
+    // Capture thread — Capturer must be created on the thread that uses it
     std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            let mut capturer = Capturer::new(Options {
+            let mut capturer = match Capturer::build(Options {
                 fps,
                 show_cursor: true,
                 show_highlight: false,
-                excluded_targets: None,
                 output_type: FrameType::BGRAFrame,
                 output_resolution: Resolution::Captured,
-                crop_area: None,
-                target: None,
                 ..Default::default()
-            });
+            }) {
+                Ok(c) => c,
+                Err(e) => { error!("Capturer build: {e:?}"); return; }
+            };
             capturer.start_capture();
 
             loop {
                 match capturer.get_next_frame() {
-                    Ok(Frame::BGRA(f)) => {
-                        // Only send if encoder is keeping up (drop oldest if full)
+                    Ok(Frame::Video(VideoFrame::BGRA(f))) if !f.data.is_empty() => {
                         frame_tx.try_send(f.data).ok();
                     }
                     Ok(_) => {}
@@ -157,7 +160,7 @@ fn handle_session(
             capturer.stop_capture();
         })?;
 
-    // Input injection (current thread — blocks reading control msgs)
+    // Input injection — runs on this thread, blocks on ctrl.recv()
     let mut enigo = Enigo::new(&Settings::default()).context("create Enigo")?;
     let sw = width as f64;
     let sh = height as f64;
@@ -216,36 +219,9 @@ fn handle_input(enigo: &mut Enigo, msg: ControlMsg, sw: f64, sh: f64) {
     }
 }
 
-/// One-frame capture just to learn the screen resolution
-fn probe_screen_size(fps: u32) -> Result<(u32, u32)> {
-    let mut capturer = Capturer::new(Options {
-        fps: fps as u64,
-        show_cursor: false,
-        show_highlight: false,
-        excluded_targets: None,
-        output_type: FrameType::BGRAFrame,
-        output_resolution: Resolution::Captured,
-        source_rect: None,
-        target: None,
-    });
-    capturer.start_capture();
-    let result = loop {
-        match capturer.get_next_frame() {
-            Ok(Frame::BGRA(f)) => break Ok((f.width as u32, f.height as u32)),
-            Ok(_) => continue,
-            Err(e) => break Err(anyhow::anyhow!("probe capture: {e}")),
-        }
-    };
-    capturer.stop_capture();
-    result
-}
-
-/// Map a subset of winit KeyCode discriminants to enigo Key values.
-/// winit KeyCode is repr(u32) — we transmit its u32 value over the wire.
 fn winit_keycode_to_enigo(code: u32) -> Option<Key> {
-    // winit 0.30 KeyCode values (physical keyboard, US layout independent)
     Some(match code {
-        0x00 => Key::Return,       // Enter
+        0x00 => Key::Return,
         0x01 => Key::Tab,
         0x02 => Key::Space,
         0x03 => Key::Backspace,
