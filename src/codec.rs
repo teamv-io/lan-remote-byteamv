@@ -54,8 +54,8 @@ impl VideoDecoder {
     }
 
     /// Decode H.264 NAL bytes.
-    /// Returns (XRGB u32 pixels, width, height) when a frame is ready; None while buffering.
-    pub fn decode(&mut self, nal: &[u8]) -> Result<Option<(Vec<u32>, u32, u32)>> {
+    /// Returns (RGBA bytes, width, height) when a frame is ready; None while buffering.
+    pub fn decode(&mut self, nal: &[u8]) -> Result<Option<(Vec<u8>, u32, u32)>> {
         let maybe = self.dec.decode(nal).context("H.264 decode")?;
         let Some(yuv) = maybe else { return Ok(None) };
 
@@ -63,12 +63,6 @@ impl VideoDecoder {
         let mut rgba = vec![0u8; w * h * 4];
         yuv.write_rgba8(&mut rgba);
 
-        // RGBA → XRGB (0x00RRGGBB) for softbuffer
-        let pixels: Vec<u32> = rgba
-            .chunks_exact(4)
-            .map(|c| ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
-            .collect();
-
-        Ok(Some((pixels, w as u32, h as u32)))
+        Ok(Some((rgba, w as u32, h as u32)))
     }
 }

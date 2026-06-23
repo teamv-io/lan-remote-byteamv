@@ -21,9 +21,8 @@ openh264 = { version = "0.9", features = ["source"] }
 # Cross-platform input injection
 enigo = "0.6"
 
-# Windowing + pixel buffer (viewer side)
-winit = "0.30"
-softbuffer = "0.4"
+# GUI framework (replaces winit + softbuffer)
+eframe = "0.34"
 
 # Fast inter-thread channels
 crossbeam-channel = "0.5"

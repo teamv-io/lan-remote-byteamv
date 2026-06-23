@@ -1,5 +1,6 @@
 mod codec;
 mod convert;
+mod gui;
 mod host;
 mod proto;
 mod transport;
@@ -12,7 +13,7 @@ use clap::{Parser, Subcommand};
 #[command(name = "lan-remote", about = "LAN remote desktop — direct, max performance")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -47,7 +48,8 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Host { bind, port, fps, bitrate } => host::run(&bind, port, fps, bitrate),
-        Cmd::View { host, port } => viewer::run(&host, port),
+        None => gui::run(),
+        Some(Cmd::Host { bind, port, fps, bitrate }) => host::run(&bind, port, fps, bitrate),
+        Some(Cmd::View { host, port }) => viewer::run(&host, port),
     }
 }

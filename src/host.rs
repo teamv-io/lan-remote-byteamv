@@ -1,5 +1,7 @@
 use std::net::{TcpListener, UdpSocket};
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::bounded;
@@ -42,6 +44,66 @@ pub fn run(bind: &str, port: u16, fps: u32, bitrate_mbps: u32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Like `run()` but non-blocking accept loop with stop-flag support for GUI integration.
+pub fn run_with_stop(
+    bind: &str,
+    port: u16,
+    fps: u32,
+    bitrate_mbps: u32,
+    status: Arc<Mutex<String>>,
+    stop: Arc<AtomicBool>,
+) -> Result<()> {
+    if !scap::is_supported() {
+        anyhow::bail!("Screen capture not supported on this platform");
+    }
+    #[cfg(target_os = "macos")]
+    if !scap::has_permission() {
+        *status.lock().unwrap() =
+            "Screen Recording permission required. Grant in System Settings.".to_string();
+        scap::request_permission();
+        return Ok(());
+    }
+
+    let listener = TcpListener::bind(format!("{bind}:{port}")).context("bind TCP")?;
+    listener.set_nonblocking(true).context("set nonblocking")?;
+    info!("Listening on {bind}:{port} (GUI host mode)");
+    *status.lock().unwrap() = "Waiting for viewer…".to_string();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            *status.lock().unwrap() = "Stopped".to_string();
+            return Ok(());
+        }
+
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                info!("Viewer connected from {peer}");
+                *status.lock().unwrap() = format!("Viewer connected: {peer}");
+
+                // Switch back to blocking for session I/O
+                stream.set_nonblocking(false).ok();
+                if let Err(e) = handle_session(stream, peer.ip().to_string(), fps, bitrate_mbps) {
+                    error!("Session error: {e:#}");
+                }
+
+                if stop.load(Ordering::Relaxed) {
+                    *status.lock().unwrap() = "Stopped".to_string();
+                    return Ok(());
+                }
+                info!("Viewer disconnected, waiting for next connection");
+                *status.lock().unwrap() = "Waiting for viewer…".to_string();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                error!("Accept error: {e}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
 }
 
 fn handle_session(
@@ -210,7 +272,7 @@ fn handle_input(enigo: &mut Enigo, msg: ControlMsg, sw: f64, sh: f64) {
         }
         KeyPress { keycode, pressed } => {
             let dir = if pressed { Direction::Press } else { Direction::Release };
-            if let Some(key) = winit_keycode_to_enigo(keycode) {
+            if let Some(key) = wire_keycode_to_enigo(keycode) {
                 enigo.key(key, dir).ok();
             }
         }
@@ -219,7 +281,7 @@ fn handle_input(enigo: &mut Enigo, msg: ControlMsg, sw: f64, sh: f64) {
     }
 }
 
-fn winit_keycode_to_enigo(code: u32) -> Option<Key> {
+fn wire_keycode_to_enigo(code: u32) -> Option<Key> {
     Some(match code {
         0x00 => Key::Return,
         0x01 => Key::Tab,
