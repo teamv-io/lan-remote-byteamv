@@ -7,23 +7,65 @@ use eframe::egui;
 
 use crate::viewer::{egui_key_to_wire, ViewerHandle};
 
+/// Accent color used across the UI (matches the app icon).
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(67, 196, 99);
+
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("lan-remote")
-            .with_inner_size([400.0, 340.0])
-            .with_min_inner_size([320.0, 280.0]),
+            .with_title("Rust P2P Viewer")
+            .with_inner_size([440.0, 400.0])
+            .with_min_inner_size([360.0, 340.0])
+            .with_icon(std::sync::Arc::new(load_icon())),
         ..Default::default()
     };
 
     eframe::run_native(
-        "lan-remote",
+        "Rust P2P Viewer",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            setup_theme(&cc.egui_ctx);
             Ok(Box::new(App::default()) as Box<dyn eframe::App>)
         }),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Window/dock icon — raw 64×64 RGBA generated at build time (no decoder needed).
+fn load_icon() -> egui::IconData {
+    let rgba = include_bytes!("../icons/icon_64.rgba").to_vec();
+    egui::IconData { rgba, width: 64, height: 64 }
+}
+
+/// Apply a polished dark theme with the accent color and comfortable spacing.
+fn setup_theme(ctx: &egui::Context) {
+    use egui::{Color32, FontFamily, FontId, Stroke, TextStyle};
+
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = Color32::from_rgb(27, 31, 40);
+    v.window_fill = Color32::from_rgb(27, 31, 40);
+    v.extreme_bg_color = Color32::from_rgb(17, 20, 27);
+    v.selection.bg_fill = Color32::from_rgb(34, 64, 45);
+    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.hyperlink_color = ACCENT;
+    v.widgets.inactive.bg_fill = Color32::from_rgb(38, 43, 54);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(38, 43, 54);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(48, 54, 67);
+    ctx.set_visuals(v);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    style.spacing.slider_width = 150.0;
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(26.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
+        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace)),
+    ]
+    .into();
+    ctx.set_style(style);
 }
 
 // ─── Tab ──────────────────────────────────────────────────────────────────────
@@ -150,32 +192,44 @@ impl App {
             // Title
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new("lan-remote")
+                    egui::RichText::new("Rust P2P Viewer")
                         .heading()
                         .strong(),
                 );
                 ui.label(
-                    egui::RichText::new("Direct LAN · Max Performance")
+                    egui::RichText::new("Direct LAN · Low Latency")
                         .small()
-                        .color(egui::Color32::GRAY),
+                        .color(egui::Color32::from_gray(140)),
                 );
             });
 
-            ui.add_space(8.0);
+            ui.add_space(12.0);
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(12.0);
 
-            // Tab bar (centered)
-            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+            // Tab bar (centered, segmented look)
+            ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Host, "  HOST  ");
-                    ui.selectable_value(&mut self.tab, Tab::View, "  VIEW  ");
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let tab_size = egui::vec2(96.0, 30.0);
+                    if ui
+                        .add_sized(tab_size, egui::SelectableLabel::new(self.tab == Tab::Host, "HOST"))
+                        .clicked()
+                    {
+                        self.tab = Tab::Host;
+                    }
+                    if ui
+                        .add_sized(tab_size, egui::SelectableLabel::new(self.tab == Tab::View, "VIEW"))
+                        .clicked()
+                    {
+                        self.tab = Tab::View;
+                    }
                 });
             });
 
-            ui.add_space(8.0);
-            ui.separator();
             ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(16.0);
 
             match self.tab {
                 Tab::Host => self.show_host_tab(ui),
@@ -193,7 +247,7 @@ impl App {
                 ui.label(
                     egui::RichText::new(&self.local_ip)
                         .monospace()
-                        .color(egui::Color32::from_rgb(80, 200, 80)),
+                        .color(ACCENT),
                 );
                 ui.end_row();
 
@@ -225,8 +279,11 @@ impl App {
             if let Some(stop) = hosting_stop {
                 if ui
                     .add(
-                        egui::Button::new("⬛  Stop")
-                            .min_size(egui::vec2(180.0, 36.0)),
+                        egui::Button::new(
+                            egui::RichText::new("⬛  Stop").strong(),
+                        )
+                        .fill(egui::Color32::from_rgb(200, 70, 60))
+                        .min_size(egui::vec2(200.0, 40.0)),
                     )
                     .clicked()
                 {
@@ -236,8 +293,13 @@ impl App {
             } else if !is_hosting {
                 if ui
                     .add(
-                        egui::Button::new("▶  Start Hosting")
-                            .min_size(egui::vec2(180.0, 36.0)),
+                        egui::Button::new(
+                            egui::RichText::new("▶  Start Hosting")
+                                .color(egui::Color32::from_rgb(15, 22, 16))
+                                .strong(),
+                        )
+                        .fill(ACCENT)
+                        .min_size(egui::vec2(200.0, 40.0)),
                     )
                     .clicked()
                 {
@@ -278,7 +340,7 @@ impl App {
                     let s = status.lock().unwrap().clone();
                     ui.label(
                         egui::RichText::new(format!("● {s}"))
-                            .color(egui::Color32::from_rgb(80, 200, 80))
+                            .color(ACCENT)
                             .small(),
                     );
                 }
@@ -322,7 +384,13 @@ impl App {
 
         // Connect button (centered)
         ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-            let btn = egui::Button::new("▶  Connect").min_size(egui::vec2(180.0, 36.0));
+            let btn = egui::Button::new(
+                egui::RichText::new("▶  Connect")
+                    .color(egui::Color32::from_rgb(15, 22, 16))
+                    .strong(),
+            )
+            .fill(ACCENT)
+            .min_size(egui::vec2(200.0, 40.0));
             if ui.add_enabled(can_connect, btn).clicked() {
                 self.connect_error = None;
                 let ip = self.host_ip.clone();

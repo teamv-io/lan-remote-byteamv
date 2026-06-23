@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "lan-remote", about = "LAN remote desktop — direct, max performance")]
+#[command(name = "rust-p2p-viewer", about = "Direct LAN peer-to-peer remote desktop — low latency")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("lan_remote=info".parse()?),
+                .add_directive("rust_p2p_viewer=info".parse()?),
         )
         .init();
 

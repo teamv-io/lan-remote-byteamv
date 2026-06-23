@@ -1,0 +1,16 @@
+# Rust build output
+/target
+
+# Packaged installers / bundles
+*.dmg
+*.msi
+*-setup.exe
+*.app
+
+# Downloaded release binaries (test copies)
+/rust-p2p-viewer-macos-arm64
+/rust-p2p-viewer-windows-x64.exe
+/lan-remote-macos-arm64
+
+# OS noise
+.DS_Store

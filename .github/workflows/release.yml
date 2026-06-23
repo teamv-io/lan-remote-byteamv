@@ -17,12 +17,14 @@ jobs:
           - name: Windows x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: lan-remote.exe
+            bin: rust-p2p-viewer.exe
+            formats: nsis
 
           - name: macOS Apple Silicon
             os: macos-14          # GitHub M1/M2 runner (arm64)
             target: aarch64-apple-darwin
-            binary: lan-remote
+            bin: rust-p2p-viewer
+            formats: dmg
 
     runs-on: ${{ matrix.os }}
 
@@ -34,7 +36,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # openh264 downloads a prebuilt .so/.dll at build time — worth caching
+      # openh264 downloads/builds a prebuilt lib — worth caching
       - name: Cache cargo registry + build artifacts
         uses: actions/cache@v4
         with:
@@ -45,14 +47,34 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      # Each runner is already native to its target (macos-14 = arm64,
+      # windows-latest = x64), so we build natively into target/release —
+      # no --target juggling, and cargo-packager finds the binary directly.
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release
 
-      - name: Upload artifact
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Build installer
+        run: cargo packager --release --formats ${{ matrix.formats }} --verbose
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p out
+          # Raw binary
+          cp "target/release/${{ matrix.bin }}" out/
+          # Installers (.dmg / *-setup.exe / .msi) — names may contain spaces
+          find target -maxdepth 3 \( -name "*.dmg" -o -name "*-setup.exe" -o -name "*.msi" \) -exec cp {} out/ \;
+          echo "--- collected ---"
+          ls -la out
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: lan-remote-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          name: ${{ matrix.target }}
+          path: out/*
           if-no-files-found: error
 
   # GitHub Release is only created when a v* tag is pushed
@@ -70,18 +92,38 @@ jobs:
           path: artifacts
 
       - name: Prepare release assets
+        shell: bash
         run: |
-          mv artifacts/lan-remote-x86_64-pc-windows-msvc/lan-remote.exe  lan-remote-windows-x64.exe
-          mv artifacts/lan-remote-aarch64-apple-darwin/lan-remote         lan-remote-macos-arm64
-          chmod +x lan-remote-macos-arm64
+          mkdir -p release
+          # macOS installer + raw binary
+          find artifacts -name "*.dmg" -exec cp {} "release/RustP2PViewer-macos-arm64.dmg" \;
+          cp "artifacts/aarch64-apple-darwin/rust-p2p-viewer" "release/rust-p2p-viewer-macos-arm64" 2>/dev/null || true
+          chmod +x "release/rust-p2p-viewer-macos-arm64" 2>/dev/null || true
+          # Windows installer + raw binary
+          find artifacts -name "*-setup.exe" -exec cp {} "release/RustP2PViewer-windows-x64-setup.exe" \;
+          cp "artifacts/x86_64-pc-windows-msvc/rust-p2p-viewer.exe" "release/rust-p2p-viewer-windows-x64.exe" 2>/dev/null || true
+          echo "--- release assets ---"
+          ls -la release
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: "lan-remote ${{ github.ref_name }}"
+          name: "Rust P2P Viewer ${{ github.ref_name }}"
           draft: false
           prerelease: false
           generate_release_notes: true
+          body: |
+            ## Install
+
+            **macOS (Apple Silicon)** — download `RustP2PViewer-macos-arm64.dmg`, open it, drag the app to Applications.
+            On first launch, right-click the app → **Open** (it isn't code-signed, so Gatekeeper needs a one-time manual allow), or run:
+            ```
+            xattr -dr com.apple.quarantine "/Applications/Rust P2P Viewer.app"
+            ```
+
+            **Windows (x64)** — download `RustP2PViewer-windows-x64-setup.exe` and run it.
+            SmartScreen may warn because it's unsigned → **More info → Run anyway**.
+
+            Standalone CLI binaries (`*-macos-arm64`, `*-windows-x64.exe`) are also attached.
           files: |
-            lan-remote-windows-x64.exe
-            lan-remote-macos-arm64
+            release/*

@@ -28,7 +28,7 @@ pub fn run(bind: &str, port: u16, fps: u32, bitrate_mbps: u32) -> Result<()> {
 
     let listener = TcpListener::bind(format!("{bind}:{port}")).context("bind TCP")?;
     info!("Listening on {bind}:{port}");
-    info!("Run `lan-remote view <this_ip>` on the viewer machine");
+    info!("Run `rust-p2p-viewer view <this_ip>` on the viewer machine");
 
     for incoming in listener.incoming() {
         match incoming {

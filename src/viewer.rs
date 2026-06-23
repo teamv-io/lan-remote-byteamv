@@ -187,7 +187,7 @@ fn udp_receiver(nal_tx: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
 pub fn run(host: &str, port: u16) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("lan-remote viewer")
+            .with_title("Rust P2P Viewer")
             .with_inner_size([1280.0, 720.0])
             .with_resizable(true),
         ..Default::default()
@@ -195,7 +195,7 @@ pub fn run(host: &str, port: u16) -> Result<()> {
 
     let host = host.to_string();
     eframe::run_native(
-        "lan-remote viewer",
+        "Rust P2P Viewer",
         options,
         Box::new(move |cc| {
             let handle = spawn_threads(&host, port, cc.egui_ctx.clone())
