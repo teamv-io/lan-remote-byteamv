@@ -1,5 +1,6 @@
 mod codec;
 mod convert;
+mod crypto;
 mod gui;
 mod host;
 mod proto;
@@ -10,7 +11,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "rust-p2p-viewer", about = "Direct LAN peer-to-peer remote desktop — low latency")]
+#[command(
+    name = "rust-p2p-viewer",
+    about = "Direct LAN peer-to-peer remote desktop — low latency"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -28,6 +32,8 @@ enum Cmd {
         fps: u32,
         #[arg(long, default_value = "8", help = "H.264 bitrate in Mbps")]
         bitrate: u32,
+        #[arg(short = 'k', long, default_value = "", help = "Connection password")]
+        password: String,
     },
     /// Connect and view/control a remote host
     View {
@@ -35,6 +41,8 @@ enum Cmd {
         host: String,
         #[arg(short, long, default_value = "7272", help = "Host TCP control port")]
         port: u16,
+        #[arg(short = 'k', long, default_value = "", help = "Connection password")]
+        password: String,
     },
 }
 
@@ -49,7 +57,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         None => gui::run(),
-        Some(Cmd::Host { bind, port, fps, bitrate }) => host::run(&bind, port, fps, bitrate),
-        Some(Cmd::View { host, port }) => viewer::run(&host, port),
+        Some(Cmd::Host {
+            bind,
+            port,
+            fps,
+            bitrate,
+            password,
+        }) => host::run(&bind, port, fps, bitrate, &password),
+        Some(Cmd::View {
+            host,
+            port,
+            password,
+        }) => viewer::run(&host, port, &password),
     }
 }

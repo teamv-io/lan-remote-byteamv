@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{TcpStream, UdpSocket};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,8 +10,9 @@ use eframe::egui;
 use tracing::{error, info, warn};
 
 use crate::codec::VideoDecoder;
-use crate::proto::{ControlMsg, InboundVideo, VIDEO_PORT};
-use crate::transport::ControlChannel;
+use crate::crypto::{derive_key, Cipher};
+use crate::proto::{ControlMsg, InboundVideo};
+use crate::transport::{recv_salt, ControlChannel};
 
 /// A decoded RGBA frame ready for display
 pub struct RgbaFrame {
@@ -31,18 +32,34 @@ pub struct ViewerHandle {
 
 /// Connects + handshakes synchronously, then spawns decode pipeline threads.
 /// Returns ViewerHandle with channels. Setting stop=true causes all threads to exit.
-pub fn spawn_threads(host: &str, port: u16, ctx: egui::Context) -> Result<ViewerHandle> {
+pub fn spawn_threads(
+    host: &str,
+    port: u16,
+    password: &str,
+    ctx: egui::Context,
+) -> Result<ViewerHandle> {
     let addr = format!("{host}:{port}");
-    let stream = TcpStream::connect(&addr).context("connect to host")?;
+    let mut stream = TcpStream::connect(&addr).context("connect to host")?;
     stream.set_nodelay(true)?;
     info!("Connected to {addr}");
 
-    let mut ctrl = ControlChannel::new(stream);
-    ctrl.send(&ControlMsg::Hello)?;
+    // Bind our UDP video socket first so we can tell the host which port to stream
+    // to (per-connection, so one viewer can receive from multiple hosts at once).
+    let udp_sock = UdpSocket::bind("0.0.0.0:0").context("bind UDP video socket")?;
+    let udp_port = udp_sock.local_addr().context("UDP local addr")?.port();
 
-    let (remote_w, remote_h, fps) = match ctrl.recv()? {
-        ControlMsg::Welcome { width, height, fps } => (width, height, fps),
-        other => anyhow::bail!("expected Welcome, got {other:?}"),
+    // Encryption handshake: read the host's salt, derive the shared key.
+    let salt = recv_salt(&mut stream)?;
+    let key = derive_key(password, &salt)?;
+    let cipher = Cipher::new(&key);
+
+    let mut ctrl = ControlChannel::new(stream, cipher.clone());
+    ctrl.send(&ControlMsg::Hello { udp_port })?;
+
+    let (remote_w, remote_h, fps) = match ctrl.recv() {
+        Ok(ControlMsg::Welcome { width, height, fps }) => (width, height, fps),
+        Ok(other) => anyhow::bail!("expected Welcome, got {other:?}"),
+        Err(_) => anyhow::bail!("Incorrect password, or the host rejected the connection"),
     };
     info!("Remote screen {remote_w}×{remote_h} @ {fps} fps");
 
@@ -55,12 +72,13 @@ pub fn spawn_threads(host: &str, port: u16, ctx: egui::Context) -> Result<Viewer
     // Channel: input events from GUI → TCP sender
     let (input_tx, input_rx) = bounded::<ControlMsg>(64);
 
-    // UDP receiver thread — assembles chunks into complete H.264 NALs
+    // UDP receiver thread — decrypts datagrams, assembles chunks into complete NALs
     {
         let stop = stop.clone();
+        let cipher = cipher.clone();
         std::thread::Builder::new()
             .name("udp-recv".into())
-            .spawn(move || udp_receiver(nal_tx, stop))?;
+            .spawn(move || udp_receiver(udp_sock, cipher, nal_tx, stop))?;
     }
 
     // Decoder thread
@@ -73,21 +91,30 @@ pub fn spawn_threads(host: &str, port: u16, ctx: egui::Context) -> Result<Viewer
             .spawn(move || {
                 let mut dec = match VideoDecoder::new() {
                     Ok(d) => d,
-                    Err(e) => { error!("Decoder init: {e:#}"); return; }
+                    Err(e) => {
+                        error!("Decoder init: {e:#}");
+                        return;
+                    }
                 };
                 loop {
-                    if stop.load(Ordering::Relaxed) { break; }
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     match nal_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(nal) => {
-                            match dec.decode(&nal) {
-                                Ok(Some((data, w, h))) => {
-                                    frame_tx2.try_send(RgbaFrame { data, width: w, height: h }).ok();
-                                    ctx2.request_repaint();
-                                }
-                                Ok(None) => {}
-                                Err(e) => warn!("Decode error: {e}"),
+                        Ok(nal) => match dec.decode(&nal) {
+                            Ok(Some((data, w, h))) => {
+                                frame_tx2
+                                    .try_send(RgbaFrame {
+                                        data,
+                                        width: w,
+                                        height: h,
+                                    })
+                                    .ok();
+                                ctx2.request_repaint();
                             }
-                        }
+                            Ok(None) => {}
+                            Err(e) => warn!("Decode error: {e}"),
+                        },
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
@@ -100,16 +127,18 @@ pub fn spawn_threads(host: &str, port: u16, ctx: egui::Context) -> Result<Viewer
         let stop = stop.clone();
         std::thread::Builder::new()
             .name("input-send".into())
-            .spawn(move || {
-                loop {
-                    if stop.load(Ordering::Relaxed) { break; }
-                    match input_rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(msg) => {
-                            if ctrl.send(&msg).is_err() { break; }
+            .spawn(move || loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match input_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(msg) => {
+                        if ctrl.send(&msg).is_err() {
+                            break;
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                 }
             })?;
     }
@@ -123,14 +152,11 @@ pub fn spawn_threads(host: &str, port: u16, ctx: egui::Context) -> Result<Viewer
     })
 }
 
-/// Receive UDP datagrams, reassemble chunks into complete H.264 NALs
-fn udp_receiver(nal_tx: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
-    let sock = match UdpSocket::bind(format!("0.0.0.0:{VIDEO_PORT}")) {
-        Ok(s) => s,
-        Err(e) => { error!("Bind UDP recv: {e}"); return; }
-    };
+/// Receive UDP datagrams, decrypt them, reassemble chunks into complete H.264 NALs
+fn udp_receiver(sock: UdpSocket, cipher: Cipher, nal_tx: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
     sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
-    info!("UDP video receiver on port {VIDEO_PORT}");
+    let local_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+    info!("UDP video receiver on port {local_port}");
 
     // frame_id → (expected_chunks, chunks_received: HashMap<chunk_idx, data>)
     let mut pending: HashMap<u32, (u16, HashMap<u16, Vec<u8>>)> = HashMap::new();
@@ -138,18 +164,31 @@ fn udp_receiver(nal_tx: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
     let mut last_seen_id: u32 = 0;
 
     loop {
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                   || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 continue;
             }
-            Err(e) => { warn!("UDP recv: {e}"); continue; }
+            Err(e) => {
+                warn!("UDP recv: {e}");
+                continue;
+            }
         };
 
-        let Some(pkt) = InboundVideo::parse(&buf[..n]) else { continue };
+        // Decrypt, then parse. Drop anything that fails to authenticate.
+        let Some(plain) = cipher.open(&buf[..n]) else {
+            continue;
+        };
+        let Some(pkt) = InboundVideo::parse(&plain) else {
+            continue;
+        };
 
         // Drop frames we've already passed
         if pkt.frame_id.wrapping_sub(last_seen_id) > 60 {
@@ -184,7 +223,7 @@ fn udp_receiver(nal_tx: Sender<Vec<u8>>, stop: Arc<AtomicBool>) {
 // ─── CLI run path ──────────────────────────────────────────────────────────────
 
 /// Used by the CLI `view` subcommand — opens its own eframe window
-pub fn run(host: &str, port: u16) -> Result<()> {
+pub fn run(host: &str, port: u16, password: &str) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Rust P2P Viewer")
@@ -194,11 +233,12 @@ pub fn run(host: &str, port: u16) -> Result<()> {
     };
 
     let host = host.to_string();
+    let password = password.to_string();
     eframe::run_native(
         "Rust P2P Viewer",
         options,
         Box::new(move |cc| {
-            let handle = spawn_threads(&host, port, cc.egui_ctx.clone())
+            let handle = spawn_threads(&host, port, &password, cc.egui_ctx.clone())
                 .expect("Failed to connect to host");
             Ok(Box::new(ViewerWindow::new(handle)) as Box<dyn eframe::App>)
         }),
@@ -270,7 +310,10 @@ impl eframe::App for ViewerWindow {
                         .clamp(0.0, 1.0);
                     let ny = ((pos.y - self.screen_rect.min.y) / self.screen_rect.height())
                         .clamp(0.0, 1.0);
-                    self.handle.input_tx.try_send(ControlMsg::MouseMove { nx, ny }).ok();
+                    self.handle
+                        .input_tx
+                        .try_send(ControlMsg::MouseMove { nx, ny })
+                        .ok();
                 }
             }
 
@@ -288,7 +331,9 @@ impl eframe::App for ViewerWindow {
             // Keyboard and pointer button events
             for event in &events {
                 match event {
-                    egui::Event::PointerButton { button, pressed, .. } => {
+                    egui::Event::PointerButton {
+                        button, pressed, ..
+                    } => {
                         let btn = match button {
                             egui::PointerButton::Primary => 0u8,
                             egui::PointerButton::Secondary => 1,
@@ -297,14 +342,20 @@ impl eframe::App for ViewerWindow {
                         };
                         self.handle
                             .input_tx
-                            .try_send(ControlMsg::MouseButton { btn, pressed: *pressed })
+                            .try_send(ControlMsg::MouseButton {
+                                btn,
+                                pressed: *pressed,
+                            })
                             .ok();
                     }
                     egui::Event::Key { key, pressed, .. } => {
                         if let Some(kc) = egui_key_to_wire(*key) {
                             self.handle
                                 .input_tx
-                                .try_send(ControlMsg::KeyPress { keycode: kc, pressed: *pressed })
+                                .try_send(ControlMsg::KeyPress {
+                                    keycode: kc,
+                                    pressed: *pressed,
+                                })
                                 .ok();
                         }
                     }

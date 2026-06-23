@@ -1,5 +1,5 @@
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
@@ -34,7 +34,11 @@ pub fn run() -> Result<()> {
 /// Window/dock icon — raw 64×64 RGBA generated at build time (no decoder needed).
 fn load_icon() -> egui::IconData {
     let rgba = include_bytes!("../icons/icon_64.rgba").to_vec();
-    egui::IconData { rgba, width: 64, height: 64 }
+    egui::IconData {
+        rgba,
+        width: 64,
+        height: 64,
+    }
 }
 
 /// Apply a polished dark theme with the accent color and comfortable spacing.
@@ -58,11 +62,23 @@ fn setup_theme(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.spacing.slider_width = 150.0;
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(26.0, FontFamily::Proportional)),
+        (
+            TextStyle::Heading,
+            FontId::new(26.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(15.0, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace)),
+        (
+            TextStyle::Button,
+            FontId::new(15.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(14.0, FontFamily::Monospace),
+        ),
     ]
     .into();
     ctx.set_style(style);
@@ -97,6 +113,8 @@ struct App {
     fps: u32,
     bitrate: u32,
     host_ip: String,
+    host_password: String,
+    view_password: String,
     local_ip: String,
     mode: Mode,
     texture: Option<egui::TextureHandle>,
@@ -112,6 +130,8 @@ impl Default for App {
             fps: 30,
             bitrate: 8,
             host_ip: String::new(),
+            host_password: String::new(),
+            view_password: String::new(),
             local_ip,
             mode: Mode::Idle,
             texture: None,
@@ -191,11 +211,7 @@ impl App {
 
             // Title
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new("Rust P2P Viewer")
-                        .heading()
-                        .strong(),
-                );
+                ui.label(egui::RichText::new("Rust P2P Viewer").heading().strong());
                 ui.label(
                     egui::RichText::new("Direct LAN · Low Latency")
                         .small()
@@ -213,13 +229,19 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let tab_size = egui::vec2(96.0, 30.0);
                     if ui
-                        .add_sized(tab_size, egui::SelectableLabel::new(self.tab == Tab::Host, "HOST"))
+                        .add_sized(
+                            tab_size,
+                            egui::SelectableLabel::new(self.tab == Tab::Host, "HOST"),
+                        )
                         .clicked()
                     {
                         self.tab = Tab::Host;
                     }
                     if ui
-                        .add_sized(tab_size, egui::SelectableLabel::new(self.tab == Tab::View, "VIEW"))
+                        .add_sized(
+                            tab_size,
+                            egui::SelectableLabel::new(self.tab == Tab::View, "VIEW"),
+                        )
                         .clicked()
                     {
                         self.tab = Tab::View;
@@ -251,15 +273,21 @@ impl App {
                 );
                 ui.end_row();
 
+                ui.label("Password:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.host_password)
+                        .password(true)
+                        .hint_text("required to connect")
+                        .desired_width(160.0),
+                );
+                ui.end_row();
+
                 ui.label("FPS:");
                 ui.add(egui::Slider::new(&mut self.fps, 5..=60));
                 ui.end_row();
 
                 ui.label("Bitrate:");
-                ui.add(
-                    egui::Slider::new(&mut self.bitrate, 1..=50)
-                        .suffix(" Mbps"),
-                );
+                ui.add(egui::Slider::new(&mut self.bitrate, 1..=50).suffix(" Mbps"));
                 ui.end_row();
             });
 
@@ -279,11 +307,9 @@ impl App {
             if let Some(stop) = hosting_stop {
                 if ui
                     .add(
-                        egui::Button::new(
-                            egui::RichText::new("⬛  Stop").strong(),
-                        )
-                        .fill(egui::Color32::from_rgb(200, 70, 60))
-                        .min_size(egui::vec2(200.0, 40.0)),
+                        egui::Button::new(egui::RichText::new("⬛  Stop").strong())
+                            .fill(egui::Color32::from_rgb(200, 70, 60))
+                            .min_size(egui::vec2(200.0, 40.0)),
                     )
                     .clicked()
                 {
@@ -309,6 +335,7 @@ impl App {
                     let stop_clone = stop.clone();
                     let fps = self.fps;
                     let bitrate = self.bitrate;
+                    let password = self.host_password.clone();
 
                     std::thread::Builder::new()
                         .name("host-run".into())
@@ -318,6 +345,7 @@ impl App {
                                 7272,
                                 fps,
                                 bitrate,
+                                password,
                                 status_clone,
                                 stop_clone,
                             ) {
@@ -338,11 +366,7 @@ impl App {
             match &self.mode {
                 Mode::Hosting { status, .. } => {
                     let s = status.lock().unwrap().clone();
-                    ui.label(
-                        egui::RichText::new(format!("● {s}"))
-                            .color(ACCENT)
-                            .small(),
-                    );
+                    ui.label(egui::RichText::new(format!("● {s}")).color(ACCENT).small());
                 }
                 _ => {
                     ui.label(
@@ -375,6 +399,15 @@ impl App {
                         .desired_width(160.0),
                 );
                 ui.end_row();
+
+                ui.label("Password:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.view_password)
+                        .password(true)
+                        .hint_text("host's password")
+                        .desired_width(160.0),
+                );
+                ui.end_row();
             });
 
         ui.add_space(16.0);
@@ -394,13 +427,14 @@ impl App {
             if ui.add_enabled(can_connect, btn).clicked() {
                 self.connect_error = None;
                 let ip = self.host_ip.clone();
+                let pw = self.view_password.clone();
                 let ctx2 = ctx.clone();
                 let (result_tx, result_rx) = crossbeam_channel::bounded(1);
 
                 std::thread::Builder::new()
                     .name("viewer-connect".into())
                     .spawn(move || {
-                        let result = crate::viewer::spawn_threads(&ip, 7272, ctx2);
+                        let result = crate::viewer::spawn_threads(&ip, 7272, &pw, ctx2);
                         result_tx.send(result).ok();
                     })
                     .ok();
@@ -474,10 +508,7 @@ impl App {
                     self.screen_rect = paint_remote(ui, tex);
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new("Connecting…")
-                                .color(egui::Color32::WHITE),
-                        );
+                        ui.label(egui::RichText::new("Connecting…").color(egui::Color32::WHITE));
                     });
                 }
             });
@@ -537,7 +568,9 @@ impl App {
                 // Keyboard + pointer buttons
                 for event in &events {
                     match event {
-                        egui::Event::PointerButton { button, pressed, .. } => {
+                        egui::Event::PointerButton {
+                            button, pressed, ..
+                        } => {
                             let btn = match button {
                                 egui::PointerButton::Primary => 0u8,
                                 egui::PointerButton::Secondary => 1,

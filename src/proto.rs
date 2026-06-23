@@ -12,21 +12,43 @@ pub const VIDEO_HDR_LEN: usize = 14;
 /// Messages sent over the TCP control channel
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMsg {
-    /// Viewer → Host: initiate session
-    Hello,
+    /// Viewer → Host: initiate session. `udp_port` is the UDP port the viewer is
+    /// listening on for the video stream (chosen per-connection so one viewer can
+    /// receive from multiple hosts without port collisions).
+    Hello {
+        udp_port: u16,
+    },
     /// Host → Viewer: screen dimensions and stream settings
-    Welcome { width: u32, height: u32, fps: u32 },
+    Welcome {
+        width: u32,
+        height: u32,
+        fps: u32,
+    },
 
     // Input events: Viewer → Host
     /// Normalized cursor position [0, 1] relative to remote screen
-    MouseMove { nx: f32, ny: f32 },
+    MouseMove {
+        nx: f32,
+        ny: f32,
+    },
     /// btn: 0=left 1=right 2=middle
-    MouseButton { btn: u8, pressed: bool },
-    MouseScroll { dx: f32, dy: f32 },
+    MouseButton {
+        btn: u8,
+        pressed: bool,
+    },
+    MouseScroll {
+        dx: f32,
+        dy: f32,
+    },
     /// Raw winit KeyCode discriminant (platform-independent scancode mapping)
-    KeyPress { keycode: u32, pressed: bool },
+    KeyPress {
+        keycode: u32,
+        pressed: bool,
+    },
     /// Unicode codepoint for printable characters (text input)
-    KeyChar { ch: u32 },
+    KeyChar {
+        ch: u32,
+    },
 
     Ping,
     Pong,

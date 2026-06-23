@@ -19,13 +19,21 @@ authors = ["teamv-io"]
 icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
 category = "Utility"
 
+[features]
+# `capture` pulls in scap (the screen-capture backend). It's on by default for
+# real builds; disabling it (`--no-default-features`) yields a viewer-only build
+# that also compiles on machines without full Xcode (scap → cidre needs it).
+default = ["capture"]
+capture = ["dep:scap"]
+
 [patch.crates-io]
 # Patch scap 0.1.0-beta.1: fix Windows backend (timespan→timestamp, WCSettings arg order)
 scap = { path = "vendor/scap" }
 
 [dependencies]
-# Screen capture — wraps DXGI (Windows) and ScreenCaptureKit (macOS)
-scap = { version = "0.1.0-beta.1" }
+# Screen capture — wraps DXGI (Windows) and ScreenCaptureKit (macOS). Optional so a
+# viewer-only build can compile without the capture backend (see [features]).
+scap = { version = "0.1.0-beta.1", optional = true }
 
 # H.264 encode/decode — downloads Cisco's prebuilt openh264 at build time
 openh264 = { version = "0.9", features = ["source"] }
@@ -38,6 +46,11 @@ eframe = "0.34"
 
 # Fast inter-thread channels
 crossbeam-channel = "0.5"
+
+# Encryption: password KDF + AEAD for control channel and video stream
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+getrandom = "0.2"
 
 # CLI / serialization / errors
 clap = { version = "4", features = ["derive"] }
