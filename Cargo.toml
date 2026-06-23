@@ -1,0 +1,33 @@
+[package]
+name = "lan-remote"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lan-remote"
+path = "src/main.rs"
+
+[dependencies]
+# Screen capture — wraps DXGI (Windows) and ScreenCaptureKit (macOS)
+scap = "0.3"
+
+# H.264 encode/decode — downloads Cisco's prebuilt openh264 at build time
+openh264 = "0.6"
+
+# Cross-platform input injection
+enigo = "0.2"
+
+# Windowing + pixel buffer (viewer side)
+winit = "0.30"
+softbuffer = "0.4"
+
+# Fast inter-thread channels
+crossbeam-channel = "0.5"
+
+# CLI / serialization / errors
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
