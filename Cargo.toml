@@ -9,13 +9,13 @@ path = "src/main.rs"
 
 [dependencies]
 # Screen capture — wraps DXGI (Windows) and ScreenCaptureKit (macOS)
-scap = "0.3"
+scap = { version = "0.1.0-beta.1" }
 
 # H.264 encode/decode — downloads Cisco's prebuilt openh264 at build time
-openh264 = "0.6"
+openh264 = { version = "0.9", features = ["source"] }
 
 # Cross-platform input injection
-enigo = "0.2"
+enigo = "0.6"
 
 # Windowing + pixel buffer (viewer side)
 winit = "0.30"

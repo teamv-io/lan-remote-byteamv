@@ -78,12 +78,12 @@ fn handle_session(
     std::thread::Builder::new()
         .name("encoder".into())
         .spawn(move || {
-            let mut enc = match VideoEncoder::new(w, h, fps, bitrate_mbps) {
+            let mut enc = match VideoEncoder::new(fps, bitrate_mbps) {
                 Ok(e) => e,
                 Err(e) => { error!("Encoder init: {e:#}"); return; }
             };
             while let Ok(bgra) = frame_rx.recv() {
-                match enc.encode_bgra(&bgra) {
+                match enc.encode_bgra(&bgra, w, h) {
                     Ok(nal) if !nal.is_empty() => { nal_tx.send(nal).ok(); }
                     Ok(_) => {}
                     Err(e) => warn!("Encode error: {e}"),
@@ -129,14 +129,15 @@ fn handle_session(
         .name("capture".into())
         .spawn(move || {
             let mut capturer = Capturer::new(Options {
-                fps: fps as u64,
+                fps,
                 show_cursor: true,
                 show_highlight: false,
                 excluded_targets: None,
                 output_type: FrameType::BGRAFrame,
                 output_resolution: Resolution::Captured,
-                source_rect: None,
+                crop_area: None,
                 target: None,
+                ..Default::default()
             });
             capturer.start_capture();
 
